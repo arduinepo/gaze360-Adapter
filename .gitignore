@@ -1,0 +1,8 @@
+/DensePose
+/frames
+/gaze360
+/out
+/videos
+*.zip
+*.tar
+*.mp4
