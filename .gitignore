@@ -1,5 +1,5 @@
 /idea
-/pycache
+/__pycache__
 /DensePose
 /frames
 /gaze360
