@@ -1,4 +1,5 @@
 import sys
+import time
 from _ctypes import Array
 from typing import Dict, List
 import cv2
@@ -39,30 +40,28 @@ class GazeVisualizer(GazeFrameRenderer):
     def generateGazeVideoFromInput(self, filePath: str, outputPath: str, index: int = 0, offset: int = 0) -> None:
         reader = imageio.get_reader(filePath)
         fps = reader.get_meta_data()['fps']
-        self.currentVideo = list(reader)
-        if offset == 0 | offset > len(self.currentVideo):
-            offset = len(self.currentVideo)
+        self.currentVideo = [reader.get_data(i) for i in range(index,index+offset)]
         self.W = max(int(fps // 8), 1)
-        self.trackInstances(index, offset)
+        self.trackInstances()
         self.compileShader()
         out = imageio.get_writer(outputPath, fps=fps)
-        for i in range(index, offset):
-            #f = self.generateFrame(i)
-            out.append_data(self.generateFrame(i))
-            #cv2.imwrite("/home/pandrieu/dev/tlab/test.jpg", f[:, :, ::-1])
+        for i in range(index, index + offset):
+            print(i)
+            f = self.generateFrame(i)
+            out.append_data(f)
+            # cv2.imwrite("/home/pandrieu/dev/tlab/test"+str(i)+".jpg", f[:, :, ::-1])
         out.close()
 
-    def trackInstances(self, index, offset):
+    def trackInstances(self):
         self.instancesTracking: Dict = self.extractor.getInstancesTracking(
-            self.extractor.extractHeadsBoxesVideo(self.currentVideo, index, offset))
+            self.extractor.extractHeadsBoxesVideo(self.currentVideo))
 
     def generateFrame(self, i: int) -> Array:
         image = self.getResizedInput(i)
         if i in self.instancesTracking:
             for id_t in self.instancesTracking[i].keys():
                 bbox, eyes = self.getBoxesEyes(i, id_t)
-                gaze = self.getGazeFromInput(self.getInputImage(i, id_t))
-                image = self.getFullImage(image, self.getGazeArrow(eyes, gaze), bbox, id_t)
+                image = self.getFullImage(image, self.getGazeArrow(eyes, self.getGazeFromInput(self.getInputImage(i, id_t))), bbox, id_t)
         return image.astype(np.uint8)
 
     def getResizedInput(self, i):
@@ -95,7 +94,7 @@ class GazeVisualizer(GazeFrameRenderer):
         return input_image
 
     def getGazeFromInput(self, inputImage):
-        return self.spherical2cartesial(self.extractor.getOutputGaze(inputImage)).detach().numpy().reshape((-1))
+        return self.spherical2cartesial(self.extractor.getOutputGazeFromFrame(inputImage)).detach().numpy().reshape((-1))
 
     def getGazeArrow(self, eyes, gaze):
         return self.render_frame(2 * eyes[0] - 1, -2 * eyes[1] + 1, -gaze[0], gaze[1], -gaze[2], 0.05)
@@ -120,9 +119,8 @@ class GazeVisualizer(GazeFrameRenderer):
         output[:, 1] = torch.sin(x[:, 1])
         return output
 
-    @staticmethod
-    def displayFrame(image) -> None:
-        plt.figure(figsize=[12, 12])
-        plt.imshow(image)
-        plt.axis('off')
-        plt.show()
+def displayFrame(image) -> None:
+    plt.figure(figsize=[12, 12])
+    plt.imshow(image)
+    plt.axis('off')
+    plt.show()
