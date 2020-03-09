@@ -8,55 +8,27 @@ in training / testing. They will not work for everyone, but many users may find 
 The behavior of functions/classes in this file is subject to change,
 since they are meant to represent the "common default behavior" people need in their projects.
 """
+import os, sys, time
 from typing import List
 import torch
-import detectron2.data.transforms as T
+import torch.multiprocessing as mp
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.data import (
     MetadataCatalog,
 )
 from detectron2.modeling import build_model
-import os
-import torch.distributed as dist
-import torch.nn as nn
-import torch.optim as optim
-import torch.multiprocessing as mp
-import multiprocessing
-from torch.nn.parallel import DistributedDataParallel as DDP
+from detectron2.config import get_cfg
+from torch.utils.data import DataLoader
+import detectron2.data.transforms as T
+from GazeData import GazeDataLoader
 
-def cleanup():
-    dist.destroy_process_group()
+sys.path.append("/home/pandrieu/dev/tlab/DensePose/")
+from densepose import add_densepose_config
 
 class PosePredictor:
-    """
-    Create a simple end-to-end predictor with the given config that runs on
-    single device for a single input image.
 
-    Compared to using the model directly, this class does the following additions:
-
-    1. Load checkpoint from `cfg.MODEL.WEIGHTS`.
-    2. Always take BGR image as the input and apply conversion defined by `cfg.INPUT.FORMAT`.
-    3. Apply resizing defined by `cfg.INPUT.{MIN,MAX}_SIZE_TEST`.
-    4. Take one input image and produce a single output, instead of a batch.
-
-    If you'd like to do anything more fancy, please refer to its source code
-    as examples to build and use the model manually.
-
-    Attributes:
-        metadata (Metadata): the metadata of the underlying dataset, obtained from
-            cfg.DATASETS.TEST.
-
-    Examples:
-
-    .. code-block:: python
-
-        pred = DefaultPredictor(cfg)
-        inputs = cv2.imread("input.jpg")
-        outputs = pred(inputs)
-    """
-
-    def __init__(self, cfg):
-        self.model = build_model(cfg).cuda()
+    def __init__(self, cfg, gpu):
+        self.model = build_model(cfg).cuda(gpu)
         self.model.eval()
         self.metadata = MetadataCatalog.get(cfg.DATASETS.TEST[0])
         checkpointer = DetectionCheckpointer(self.model)
@@ -65,7 +37,6 @@ class PosePredictor:
             [cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST
         )
         self.input_format = cfg.INPUT.FORMAT
-        self.outputs = []
         assert self.input_format in ["RGB", "BGR"], self.input_format
 
     def __call__(self, original_images):
@@ -93,7 +64,10 @@ class PosePredictor:
             for listFrames in listsFrames:
                 outputs = self.model(listFrames)
                 for output in outputs:
-                    globalOutputs.append(output['instances'])
+                    out = output['instances']
+                    globalOutputs.append(out.to("cpu"))
+                    del out
+                    torch.cuda.empty_cache()
         return globalOutputs
 
     def predictOneInput(self, image):
@@ -107,71 +81,64 @@ class PosePredictor:
             return self.model([img])[0]
 
 class PosePredictorMultiGPU:
-    def __init__(self):
-        print("dsfq")
-
-class PosePredictorGroup:
-    predictors = dict()
-
-    def __init__(self, cfg, gpus: int):
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = '12355'
-        self.predictors = dict()
-        self.gpus = gpus
+    def __init__(self, configFile, poseModelFile):
+        cfg = get_cfg()
+        add_densepose_config(cfg)
+        cfg.merge_from_file(configFile)
+        cfg.MODEL.WEIGHTS = poseModelFile
+        cfg.freeze()
         self.cfg = cfg
-        print("init group")
-        """print("izi")
-        model = build_model(cfg)
-        # torch.cuda.set_device(gpu)
-        print("izi")
-        model.cuda(0)
-        print("izi")
-        torch.distributed.init_process_group(backend="nccl",rank=0,world_size=2)
-        print("izi")
-        self.model = DDP(model)
-        print("izi")
-        self.model.eval()
-        print("izi")
-        self.metadata = MetadataCatalog.get(cfg.DATASETS.TEST[0])
-        checkpointer = DetectionCheckpointer(self.model)
-        checkpointer.load(cfg.MODEL.WEIGHTS)
-        self.transform_gen = T.ResizeShortestEdge(
-            [cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST
-        )
-        self.input_format = cfg.INPUT.FORMAT
-        self.outputs = []
-        assert self.input_format in ["RGB", "BGR"], self.input_format"""
+        mp.set_start_method("spawn", force=True)
+        smp = mp.get_context("spawn")
+        self.resultQueue = smp.Manager().list()
+        self.procs = []
+        for i in range(2):
+            cfgProc = cfg.clone()
+            cfgProc.defrost()
+            cfgProc.MODEL.DEVICE = "cuda:" + str(i)
+            self.procs.append(PosePredictorMultiGPU.PredictWorker(cfgProc, self.resultQueue, i))
 
-    def predictOutputs(self, inputs: List) -> List:
-        inputs1 = [inputs[i] for i in range(0, round(len(inputs) / 2))]
-        inputs2 = [inputs[i] for i in range(round(len(inputs) / 2), len(inputs))]
-        inputs = [inputs1, inputs2]
-        args = {'gpus': self.gpus, 'nodes': 1, 'nr': 0, 'inputs': inputs}
-        mp.spawn(self.predictOutputsOneGPU, nprocs=args['gpus'], args=(args,))
+    class PredictWorker(mp.Process):
+        def __init__(self, cfg, queue, i):
+            self.predictor = None
+            self.cfg = cfg
+            self.resultQueue = queue
+            self.inputs = None
+            self.nProc = i
+            super().__init__()
+
+        def run(self):
+            self.predictor = PosePredictor(self.cfg, self.nProc)
+            dataLoader = GazeDataLoader(self.inputs,self.cfg,self.nProc, batchSize= 3 if self.nProc==0 else 4, numWorkers=1)
+            for batchData in enumerate(dataLoader):
+                outputs = self.predictor.model(batchData[1])
+                for output in outputs:
+                    out = output['instances']
+                    self.resultQueue.append({'gpu': self.nProc, 'boxes': out.pred_boxes.tensor.detach().to("cpu"),
+                                             'dpS': out.pred_densepose.S.detach().to("cpu"),
+                                             'dpI': out.pred_densepose.I.detach().to("cpu")})
+                    del out
+                torch.cuda.empty_cache()
+
+    def __call__(self, images):
+        t = time.time()
+        median = int(round(len(images) / 2))
+        batchesGpus = [images[0:median], images[median:]]
+        i = 0
+        for p in self.procs:
+            p.inputs = batchesGpus[i]
+            p.start()
+            i += 1
+        for p in self.procs:
+            p.join()
         outputs = []
-        for predictor in self.predictors:
-            for output in predictor.outputs:
-                outputs.append(output)
+        outputsProc2 = []
+        for output in self.resultQueue:
+            if output['gpu'] == 0:
+                outputs.append((output['boxes'], output['dpS'], output['dpI']))
+            else:
+                outputsProc2.append((output['boxes'], output['dpS'], output['dpI']))
+        for output in outputsProc2:
+            outputs.append(output)
+        print((time.time() - t) / len(images))
         return outputs
-
-    def predictOutputsOneGPU(self, gpu, args):
-        print("init proc", gpu)
-        dist.init_process_group(backend='nccl',
-                                world_size=self.gpus,
-                                rank=gpu)
-        print("init model ", gpu)
-        torch.manual_seed(42)
-        model = PosePredictor(self.cfg.clone(), 0)
-        self.predictors["" + str(gpu)] = model
-        print(gpu, self, self.predictors)
-        print("itération:")
-        with torch.no_grad():
-            for image in args['inputs'][gpu]:
-                if model.input_format == "RGB":
-                    image = image[:, :, ::-1]
-                height, width = image.shape[:2]
-                image = model.transform_gen.get_transform(image).apply_image(image)
-                image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1)).cuda(0)
-                inputs = {"image": image, "height": height, "width": width}
-                model.outputs.append(model.model([inputs])[0])
-        cleanup()
