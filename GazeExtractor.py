@@ -1,22 +1,15 @@
-import sys, os
-from _ctypes import Array
-from typing import Dict, List, Tuple
+import sys
+import time
+from typing import Dict, List
 import numpy as np
 import torch
-import torch.nn.functional as F
-import time
-import cv2
-from PIL import Image
+from GazeData import GazeDataLoader, GazeDataSet
 from GazePredictor import GazePredictor
-import torchvision.transforms as transforms
 
 sys.path.append("/home/pandrieu/dev/tlab/DensePose/")
 from densepose.vis.extractor import extract_boxes_xywh_from_instances, DensePoseResultExtractor
 from densepose.structures import DensePoseDataRelative, DensePoseOutput, DensePoseResult
 from PosePredictor import PosePredictor, PosePredictorMultiGPU
-
-POSE_EXTRACTOR = DensePoseResultExtractor()
-IMAGE_NORMALIZE = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
 """
 
@@ -27,136 +20,39 @@ IMAGE_NORMALIZE = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0
 
 class GazeExtractor:
     def __init__(self, configFile: str, poseModelFile: str, gazeModelFile: str, width: int,
-                 height: int):
-        self.posePredictor = PosePredictorMultiGPU(configFile, poseModelFile)
+                 height: int, poseAccuracyThreshold, numberGpus):
+        self.posePredictor = PosePredictorMultiGPU(configFile, poseModelFile, poseAccuracyThreshold, numberGpus)
         self.gazePredictor = GazePredictor(gazeModelFile)
         self.height, self.width = height, width
-        self.W: int = 0
-        self.currentVideo = None
-        self.instancesTracking = None
 
-    def extractInstancesFromOutputs(self, outputs) -> List:
-        globalInstances = []
-        for output in outputs:
-            boxes = output[0]
-            boxes[:, 2] -= boxes[:, 0]
-            boxes[:, 3] -= boxes[:, 1]
-            listBoxes = boxes.tolist()
-            resultInstances = []
-            for j, box in enumerate(listBoxes):
-                w, h = int(box[2]), int(box[3])
-                result = torch.zeros([1, h, w], dtype=torch.uint8, device="cpu")
-                S = F.interpolate(output[1][[j]], (h, w), mode="bilinear", align_corners=False).argmax(dim=1)
-                result[0] = (F.interpolate(output[2][[j]], (h, w), mode="bilinear", align_corners=False).argmax(dim=1)
-                             * (S > 0).long()).squeeze(0)
-                resultInstances.append([boxes[j], result.numpy()[0]])
-            globalInstances.append(resultInstances)
-        return globalInstances
-
-    def predictGazesFrames(self):
-        """gazesList = []
-        for i in range(min(self.instancesTracking.keys()), max(self.instancesTracking.keys())):
-            if i in self.instancesTracking:
-                for id_t in self.instancesTracking[i].keys():
-                    gaze, _ = self.gazePredictor(self.getInputImage(i, id_t))
-                    gazesList.append(gaze)"""
-        inputs = []
-        print("input transformation for gaze inference")
-        for i in range(min(self.instancesTracking.keys()), max(self.instancesTracking.keys()) + 1):
-            print(i)
-            if i in self.instancesTracking:
-                for id_t in self.instancesTracking[i].keys():
-                    inputs.append(self.getInputImage(i, id_t))
-        gazesList = self.gazePredictor.predictMultipleInputs(inputs)
-        gazesByFrame = dict()
-        rank = 0
-        for i in range(min(self.instancesTracking.keys()), max(self.instancesTracking.keys()) + 1):
-            frame = dict()
-            if i in self.instancesTracking:
-                for j in self.instancesTracking[i].keys():
-                    frame[j] = gazesList[rank]
-                    rank += 1
-                gazesByFrame[i] = frame
-        return gazesByFrame
-
-    def getInputImage(self, indexImage, indexInstance):
-        input_image = torch.zeros(7, 3, 224, 224)
-        count = 0
-        for j in range(indexImage - 3 * self.W, indexImage + 4 * self.W, self.W):
-            if j in self.instancesTracking and indexInstance in self.instancesTracking[j]:
-                new_im = Image.fromarray(self.currentVideo[j], 'RGB')
-                bbox, eyes = self.instancesTracking[j][indexInstance]
-            else:
-                new_im = Image.fromarray(self.currentVideo[indexImage], 'RGB')
-                bbox, eyes = self.instancesTracking[indexImage][indexInstance]
-            new_im = new_im.crop((bbox[0], bbox[1], bbox[2], bbox[3]))
-            im = transforms.Resize((224, 224))(new_im)
-            input_image[count, :, :, :] = IMAGE_NORMALIZE(transforms.ToTensor()(im))
-            count += 1
-        return input_image.view(1, 7, 3, 224, 224)
-
-    def predictGazesMultipleImages(self, images):
-        globalOutputs = []
-        batches = []
-        numberImages = len(images)
-        batchSize = 20
-        batchNumber = int(round(numberImages / batchSize))
-        if batchNumber < numberImages / batchSize:
-            batchNumber += 1
-        underTotal = 0
-        with torch.no_grad():
-            for j in range(batchNumber):
-                batch = []
-                for i in range(0, min(batchSize, numberImages - underTotal)):
-                    batch.append(images[j * batchSize + i].view(1, 7, 3, 224, 224))
-                batches.append(batch)
-                underTotal += batchSize
-            for listFrames in batches:
-                # TODO : transformation préalable
-                for output in self.gazePredictor(listFrames):
-                    globalOutputs.append(output)
-        return globalOutputs
-
-    def predictGazesSingleImage(self, image):
-        self.getInstancesTracking(self.extractHeadsBoxesImage(image))
-        outputs = []
-        for id_t in self.instancesTracking[0].keys():
-            outputs.append(self.getOutputGazeFromFrame(self.getInputImage(0, id_t)))
-        return outputs
+    def extractGazeFromVideo(self, frames, fps):
+        W = max(int(fps // 8), 1)
+        print("heads boxes extraction")
+        t = time.time()
+        instancesTracking = self.getInstancesTracking(self.extractHeadsBoxesVideo(frames))
+        print("infer gazes")
+        gazesList = self.predictGazes(GazeDataLoader(GazeDataSet(frames, instancesTracking, W)))
+        print("maps gazes with frames")
+        gazes = self.buildMapFramesGazes(gazesList, instancesTracking)
+        print(time.time() - t)
+        return gazes, instancesTracking
 
     def extractHeadsBoxesVideo(self, frames: List) -> Dict:
-        final_results = dict()
-        self.currentVideo = frames
-        print("Inference")
+        headsBoxesByFrame = dict()
+        print("detect individuals")
         outputs = self.posePredictor(frames)
-        print("Extraction")
-        results = self.extractInstancesFromOutputs(outputs)
         for i in range(0, len(frames)):
             headsBoxes = []
-            for instance in results[i]:
+            for instance in outputs[i]:
                 headBox = self.extract_head_bbox(instance)
                 if len(headBox) > 0:
                     headsBoxes.append(headBox)
             if len(headsBoxes) > 0:
-                final_results[i] = headsBoxes
-        return final_results
-
-    def extractHeadsBoxesImage(self, image):
-        outputs = self.extractInstancesFromFrame(image)
-        res = dict()
-        headsBoxes = []
-        for instance in outputs:
-            headBox = self.extract_head_bbox(instance)
-            if len(headBox) > 0:
-                headsBoxes.append(headBox)
-        res[0] = headsBoxes
-        return res
-
-    def getOutputGazeFromFrame(self, image) -> torch.Tensor:
-        out, _ = self.gazePredictor(image.cuda())
-        return out
+                headsBoxesByFrame[i] = headsBoxes
+        return headsBoxesByFrame
 
     def getInstancesTracking(self, listsHeadsBoxes):
+        print("track instances")
         id_num = 0
         tracking_id = dict()
         identity_last = dict()
@@ -177,8 +73,40 @@ class GazeExtractor:
                 eyes = [(bbox_head[0] + bbox_head[2]) / 2.0, (0.65 * bbox_head[1] + 0.35 * bbox_head[3])]
                 identity_next[id_val] = (bbox_head, eyes)
             tracking_id[i] = identity_last = identity_next
-        self.instancesTracking = tracking_id
         return tracking_id
+
+    def predictGazes(self, dataLoader):
+        print("starts gaze prediction")
+        gazesList = []
+        for data in enumerate(dataLoader):
+            out = self.gazePredictor(data)
+            for o in out:
+                gazesList.append(o.detach())
+            del out
+            torch.cuda.empty_cache()
+        return gazesList
+
+    @staticmethod
+    def buildMapFramesGazes(gazesList, instances):
+        gazesByFrame = dict()
+        rank = 0
+        for i in range(min(instances.keys()), max(instances.keys()) + 1):
+            frame = dict()
+            if i in instances:
+                for j in instances[i].keys():
+                    frame[j] = gazesList[rank]
+                    rank += 1
+                gazesByFrame[i] = frame
+        return gazesByFrame
+
+    def extract_head_bbox(self, instance):
+        box = instance[0]
+        iuv_mask_head = instance[1][:, :] > 22
+        bbox = []
+        if iuv_mask_head.any():
+            bbox = self.mask_to_bbox(iuv_mask_head)
+            bbox[0], bbox[1], bbox[2], bbox[3] = bbox[0] + box[0], bbox[1] + box[1], bbox[2] + box[0], bbox[3] + box[1]
+        return bbox
 
     # renvoie clé de id_dict dont la valeur box recoupe le plus la box en paramètre
     def getInstanceFromPreviousFrame(self, bbox, id_dict) -> int:
@@ -190,26 +118,6 @@ class GazeExtractor:
                 id_final = k
                 max_iou = iou
         return id_final
-
-    def extractInstancesFromFrame(self, image) -> List:
-        outputs = self.posePredictor.predictOneInput(image)
-        result = POSE_EXTRACTOR(outputs).results
-        boxes = extract_boxes_xywh_from_instances(outputs)
-        resultInstances = []
-        for j in range(0, len(outputs)):
-            iuv_arr = DensePoseResult.decode_png_data(*result[j])[0]
-            box = boxes[j]
-            resultInstances.append([box, iuv_arr])
-        return resultInstances
-
-    def extract_head_bbox(self, instance):
-        box = instance[0]
-        iuv_mask_head = instance[1][:, :] > 22
-        bbox = []
-        if iuv_mask_head.any():
-            bbox = self.mask_to_bbox(iuv_mask_head)
-            bbox[0], bbox[1], bbox[2], bbox[3] = bbox[0] + box[0], bbox[1] + box[1], bbox[2] + box[0], bbox[3] + box[1]
-        return bbox
 
     """
     Computes Intersection Over Union (IOU) ratio of two boxes
@@ -252,16 +160,13 @@ class GazeExtractor:
         y1 = max(0, y1 + h * 0.15)
         return np.array((x0, y0, x1, y1), dtype=np.float32)
 
-    def getResizedInput(self, image):
-        return cv2.resize(image.copy(), (self.width, self.height)).astype(float)
+import matplotlib
+import matplotlib.pyplot as plt
 
-    def getBoxesEyes(self, i, j):
-        bbox, eyes = self.instancesTracking[i][j]
-        bbox = np.asarray(bbox).astype(int)
-        imageShape = self.currentVideo[i].shape
-        dim0, dim1 = imageShape[0:2]
-        bbox[0], bbox[2], bbox[1], bbox[3] = self.width * bbox[0] / dim1, self.width * bbox[2] / dim1, self.height * \
-                                             bbox[1] / dim0, self.height * bbox[3] / dim0
-        eyes = np.asarray(eyes).astype(float)
-        eyes[0], eyes[1] = eyes[0] / float(dim1), eyes[1] / float(dim0)
-        return bbox, eyes
+matplotlib.use('TkAgg')
+
+def displayFrame(image) -> None:
+    plt.figure(figsize=[12, 12])
+    plt.imshow(image)
+    plt.axis('off')
+    plt.show()

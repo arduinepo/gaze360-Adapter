@@ -1,14 +1,10 @@
 import sys
-import time
-from _ctypes import Array
-from typing import Dict, List
 import cv2
 import numpy as np
 import torch
 from torch import Tensor as Tensor
 import imageio
 import random
-
 import matplotlib
 import matplotlib.pyplot as plt
 from GazeFrameRenderer import GazeFrameRenderer
@@ -30,61 +26,36 @@ class GazeVisualizer(GazeFrameRenderer):
         self.extractor: GazeExtractor = gazeExtractor
         self.color_encoding = [[random.randint(0, 254), random.randint(0, 254), random.randint(0, 254)] for i in
                                range(0, 1000)]
+        self.frames = None
+        self.instances = None
 
     def generateGazeVideo(self, filePath: str, outputPath: str, index: int = 0, offset: int = 0) -> None:
         reader = imageio.get_reader(filePath)
         fps = reader.get_meta_data()['fps']
-        self.extractor.W = max(int(fps // 8), 1)
-        frames = [reader.get_data(i) for i in range(index, index + offset)]
-        print("INfer and extract head boxes")
-        instancesTracking = self.trackInstances(frames)
-        print("Infer gazes")
-        gazes = self.extractor.predictGazesFrames()
+        self.frames = [reader.get_data(i) for i in range(index, index + offset)]
+        gazes, self.instances = self.extractor.extractGazeFromVideo(self.frames, fps)
         self.compileShader()
         out = imageio.get_writer(outputPath, fps=fps)
-        print("Render gazes")
-        for i in range(0,offset):
-            print(i)
-            image = self.extractor.getResizedInput(frames[i])
-            if i in instancesTracking:
-                for id_t in instancesTracking[i].keys():
-                    bbox, eyes = self.extractor.getBoxesEyes(i, id_t)
-                    image = self.getFullImage(image, self.getGazeArrow(eyes, self.spherical2cartesial(gazes[i][id_t]).detach().numpy().reshape((-1))), bbox, id_t)
+        print("write frames")
+        for i in range(0, offset):
+            if i % 10 == 0:
+                print("frame", i)
+            image = self.getResizedInput(self.frames[i])
+            if i in self.instances:
+                for id_t in self.instances[i].keys():
+                    bbox, eyes = self.getBoxesEyes(i, id_t)
+                    image = self.getFullImage(image, self.getGazeArrow(eyes, self.spherical2cartesial(
+                        gazes[i][id_t]).detach().numpy().reshape((-1))), bbox, id_t)
             out.append_data(image.astype(np.uint8))
-            # cv2.imwrite("/home/pandrieu/dev/tlab/test"+str(i)+".jpg", f[:, :, ::-1])
         out.close()
 
     def addSingleGazeToFrame(self, gaze, frame, instance, currentImage):
-        bbox, eyes = self.extractor.getBoxesEyes(frame, instance)
+        bbox, eyes = self.getBoxesEyes(frame, instance)
         gaze = self.spherical2cartesial(gaze).detach().numpy().reshape((-1))
         return self.getFullImage(currentImage, self.getGazeArrow(eyes, gaze), bbox, instance)
 
-    def generateGazeVideoFromInput(self, filePath: str, outputPath: str, index: int = 0, offset: int = 0) -> None:
-        reader = imageio.get_reader(filePath)
-        fps = reader.get_meta_data()['fps']
-        self.extractor.W = max(int(fps // 8), 1)
-        currentVideo = [reader.get_data(i) for i in range(index, index + offset)]
-        instancesTracking = self.trackInstances(currentVideo)
-        self.compileShader()
-        out = imageio.get_writer(outputPath, fps=fps)
-        for i in range(0, offset):
-            print("generates:",i)
-            image = self.extractor.getResizedInput(currentVideo[i])
-            if i in instancesTracking:
-                for id_t in instancesTracking[i].keys():
-                    bbox, eyes = self.extractor.getBoxesEyes(i, id_t)
-                    image = self.getFullImage(image, self.getGazeArrow(eyes, self.getGazeFromInput(
-                        self.extractor.getInputImage(i, id_t))), bbox, id_t)
-            out.append_data(image.astype(np.uint8))
-            # cv2.imwrite("/home/pandrieu/dev/tlab/test"+str(i)+".jpg", f[:, :, ::-1])
-        out.close()
-
-    def trackInstances(self, video):
-        return self.extractor.getInstancesTracking(self.extractor.extractHeadsBoxesVideo(video))
-
-    def getGazeFromInput(self, inputImage):
-        return self.spherical2cartesial(self.extractor.getOutputGazeFromFrame(inputImage)).detach().numpy().reshape(
-            (-1))
+    def getResizedInput(self, image):
+        return cv2.resize(image.copy(), (self.width, self.height)).astype(float)
 
     def getGazeArrow(self, eyes, gaze):
         return self.render_frame(2 * eyes[0] - 1, -2 * eyes[1] + 1, -gaze[0], gaze[1], -gaze[2], 0.05)
@@ -100,6 +71,17 @@ class GazeVisualizer(GazeFrameRenderer):
             ((imgArrow[:, :, 0] + imgArrow[:, :, 1] + imgArrow[:, :, 2]) == 0.0).astype(float),
             (self.height, self.width, 1))
         return np.concatenate((binary_img, binary_img, binary_img), axis=2)
+
+    def getBoxesEyes(self, i, j):
+        bbox, eyes = self.instances[i][j]
+        bbox = np.asarray(bbox).astype(int)
+        imageShape = self.frames[i].shape
+        dim0, dim1 = imageShape[0:2]
+        bbox[0], bbox[2], bbox[1], bbox[3] = self.width * bbox[0] / dim1, self.width * bbox[2] / dim1, self.height * \
+                                             bbox[1] / dim0, self.height * bbox[3] / dim0
+        eyes = np.asarray(eyes).astype(float)
+        eyes[0], eyes[1] = eyes[0] / float(dim1), eyes[1] / float(dim0)
+        return bbox, eyes
 
     @staticmethod
     def spherical2cartesial(x: Tensor) -> Tensor:
